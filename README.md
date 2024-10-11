@@ -1,5 +1,3 @@
-Here's a simple `README.md` file for your traffic density monitoring project on GitHub:
-
 ```markdown
 # Traffic Density Monitoring System
 
