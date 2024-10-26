@@ -19,8 +19,8 @@ logging.basicConfig(
 )
 
 # Constants for traffic density thresholds
-LOW_THRESHOLD: int = 5      
-MEDIUM_THRESHOLD: int = 10   
+LOW_THRESHOLD: int = 5
+MEDIUM_THRESHOLD: int = 10
 
 # Vehicle classes based on YOLOv8's COCO dataset
 VEHICLE_CLASSES: set = {'car', 'truck', 'bus', 'motorbike', 'bicycle'}
@@ -38,7 +38,8 @@ class ReportGenerator:
         self,
         timestamps: List[datetime],
         vehicle_counts: List[int],
-        vehicle_type_counts: List[Dict[str, int]]
+        vehicle_type_counts: List[Dict[str, int]],
+        accuracies: List[float]  # Added accuracies to the report
     ) -> None:
         """
         Generates an HTML report summarizing traffic metrics and vehicle types.
@@ -47,6 +48,7 @@ class ReportGenerator:
             timestamps (List[datetime]): List of timestamps corresponding to each frame.
             vehicle_counts (List[int]): List of total vehicle counts per frame.
             vehicle_type_counts (List[Dict[str, int]]): List of vehicle type counts per frame.
+            accuracies (List[float]): List of accuracy metrics per frame.
         """
         try:
             if not timestamps or not vehicle_counts:
@@ -60,12 +62,12 @@ class ReportGenerator:
                 report_file.write("<html><head><title>Traffic Report</title></head><body>")
                 report_file.write("<h1>Traffic Density Over Time</h1>")
                 report_file.write("<table border='1'>")
-                report_file.write("<tr><th>Timestamp</th><th>Total Vehicle Count</th>")
+                report_file.write("<tr><th>Timestamp</th><th>Total Vehicle Count</th><th>Accuracy (%)</th>")
                 for vehicle_type in sorted(VEHICLE_CLASSES):
                     report_file.write(f"<th>{vehicle_type.capitalize()} Count</th>")
                 report_file.write("</tr>")
-                for ts, count, type_counts in zip(timestamps, vehicle_counts, vehicle_type_counts):
-                    report_file.write(f"<tr><td>{ts.strftime('%H:%M:%S')}</td><td>{count}</td>")
+                for ts, count, accuracy, type_counts in zip(timestamps, vehicle_counts, accuracies, vehicle_type_counts):
+                    report_file.write(f"<tr><td>{ts.strftime('%H:%M:%S')}</td><td>{count}</td><td>{accuracy:.2f}</td>")
                     for vehicle_type in sorted(VEHICLE_CLASSES):
                         report_file.write(f"<td>{type_counts.get(vehicle_type, 0)}</td>")
                     report_file.write("</tr>")
@@ -87,26 +89,27 @@ class TrafficMonitor:
         source: Union[str, int],
         model_path: str = 'yolov8x.pt',
         output_folder: str = 'traffic_reports',
-        output_video_path: str = 'output_video.avi'
+        output_video_name: str = 'output_video.avi'
     ) -> None:
         self.source: Union[str, int] = source
         self.output_folder: Path = Path(output_folder)
-        self.output_video_path: Path = Path(output_video_path)
+        self.output_video_path: Path = self.output_folder / output_video_name  # Ensured video is in output folder
         self.model_path: str = model_path
         self.model: Optional[YOLO] = None
         self.cap: Optional[cv2.VideoCapture] = None
         self.timestamps: List[datetime] = []
         self.vehicle_counts: List[int] = []
         self.vehicle_type_counts: List[Dict[str, int]] = []
+        self.accuracies: List[float] = []  # List to store accuracy metrics
         self.report_generator: Optional[ReportGenerator] = None
         self.frame_number: int = 0
         self.frame_width: int = 0
         self.frame_height: int = 0
         self.legend_ratio: float = 0.2  # Increased to accommodate percentage display
-        self.colors: Dict[str, Tuple[int, int, int]] = {
-            'Low Traffic': (0, 255, 0),
-            'Medium Traffic': (0, 165, 255),
-            'High Traffic': (0, 0, 255)
+        self.colors: Dict[str, Tuple[int, int, int]] = {  # Adjusted colors for clarity
+            'Low Traffic': (0, 255, 0),         # Green
+            'Medium Traffic': (0, 165, 255),   # Orange
+            'High Traffic': (0, 0, 255)        # Red
         }
         self.tracked_objects: Dict[int, Dict[str, Union[str, Tuple[int, int, int, int]]]] = {}
         self.next_object_id: int = 0  # ID to assign to the next detected object
@@ -123,7 +126,7 @@ class TrafficMonitor:
         self._create_output_folder()
         self._load_yolo_model()
         self.report_generator = ReportGenerator(self.output_folder)
-        self._initialize_video_writer()
+        # VideoWriter will be initialized after reading the first frame
 
     def _create_output_folder(self) -> None:
         """
@@ -147,20 +150,6 @@ class TrafficMonitor:
             logging.error(f"Failed to load YOLOv8 model: {e}")
             sys.exit(1)
 
-    def _initialize_video_writer(self) -> None:
-        """
-        Initialize the VideoWriter to save the annotated output video.
-        """
-        try:
-            # Define the codec and create VideoWriter object
-            fourcc: int = cv2.VideoWriter_fourcc(*'XVID')
-            # Placeholder frame size; it will be initialized after reading the first frame
-            self.video_writer = None
-            logging.info("VideoWriter initialized.")
-        except Exception as e:
-            logging.error(f"Failed to initialize VideoWriter: {e}")
-            sys.exit(1)
-
     @staticmethod
     def classify_traffic_density(vehicle_count: int) -> str:
         """
@@ -179,23 +168,27 @@ class TrafficMonitor:
         else:
             return 'High Traffic'
 
-    def _process_detections(self, detections) -> Tuple[int, Dict[str, int]]:
+    def _process_detections(self, detections) -> Tuple[int, Dict[str, int], float]:
         """
-        Process YOLO detections, track vehicles, and count vehicle types.
+        Process YOLO detections, track vehicles, count vehicle types, and calculate frame accuracy.
 
         Args:
             detections: YOLO detections for the current frame.
 
         Returns:
-            Tuple[int, Dict[str, int]]: Number of unique vehicles detected and a dictionary of vehicle type counts.
+            Tuple[int, Dict[str, int], float]: Number of unique vehicles detected, vehicle type counts, and accuracy metric.
         """
         vehicle_type_count: Dict[str, int] = defaultdict(int)
+        confidences: List[float] = []
+
         for det in detections:
             try:
                 cls_id: int = int(det.cls[0])
                 cls_name: str = self.model.names.get(cls_id, '')
                 if cls_name in VEHICLE_CLASSES:
                     vehicle_type_count[cls_name] += 1
+                    confidences.append(float(det.conf[0]))  # Collect confidence scores
+
                     # Draw bounding box and label
                     x1, y1, x2, y2 = map(int, det.xyxy[0])
                     cv2.rectangle(
@@ -209,8 +202,10 @@ class TrafficMonitor:
                     self._assign_object_id(cls_name, (x1, y1, x2, y2))
             except Exception as e:
                 logging.error(f"Error processing detection: {e}")
+
+        average_confidence: float = np.mean(confidences) if confidences else 0.0
         unique_vehicles = len(self.tracked_objects)
-        return unique_vehicles, dict(vehicle_type_count)
+        return unique_vehicles, dict(vehicle_type_count), average_confidence * 100  # Percentage
 
     def _assign_object_id(self, cls_name: str, bbox: Tuple[int, int, int, int]) -> None:
         """
@@ -244,15 +239,17 @@ class TrafficMonitor:
         self,
         traffic_density: str,
         total_vehicles: int,
-        vehicle_type_counts: Dict[str, int]
+        vehicle_type_counts: Dict[str, int],
+        accuracy: float  # Display accuracy in the legend
     ) -> None:
         """
-        Adds a legend panel on the right side of the frame displaying vehicle counts, traffic density, and density percentages.
+        Adds a legend panel on the right side of the frame displaying vehicle counts, traffic density, density percentages, and accuracy.
 
         Args:
             traffic_density (str): The classified traffic density.
             total_vehicles (int): Total number of vehicles detected.
             vehicle_type_counts (Dict[str, int]): Dictionary of vehicle types and their counts.
+            accuracy (float): Accuracy metric for the current frame.
         """
         try:
             # Calculate legend width based on frame width
@@ -280,22 +277,33 @@ class TrafficMonitor:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2
             )
 
+            # Display accuracy
+            cv2.putText(
+                legend, f"Accuracy: {accuracy:.2f}%", (10, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2
+            )
+
             # Calculate and display traffic density percentages
             total_classifications = self.high_traffic_count + self.medium_traffic_count + (self.frame_number - self.high_traffic_count - self.medium_traffic_count)
             high_percentage: float = (self.high_traffic_count / total_classifications) * 100 if total_classifications else 0
             medium_percentage: float = (self.medium_traffic_count / total_classifications) * 100 if total_classifications else 0
+            low_percentage: float = 100 - high_percentage - medium_percentage
 
             cv2.putText(
-                legend, f"High Traffic Frames: {high_percentage:.2f}%", (10, 140),
+                legend, f"High Traffic Frames: {high_percentage:.2f}%", (10, 170),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['High Traffic'], 2
             )
             cv2.putText(
-                legend, f"Medium Traffic Frames: {medium_percentage:.2f}%", (10, 170),
+                legend, f"Medium Traffic Frames: {medium_percentage:.2f}%", (10, 200),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['Medium Traffic'], 2
+            )
+            cv2.putText(
+                legend, f"Low Traffic Frames: {low_percentage:.2f}%", (10, 230),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['Low Traffic'], 2
             )
 
             # Display vehicle type counts
-            y_offset = 210
+            y_offset = 270
             for vehicle_type in sorted(VEHICLE_CLASSES):
                 count = vehicle_type_counts.get(vehicle_type, 0)
                 text = f"{vehicle_type.capitalize()}: {count}"
@@ -328,6 +336,10 @@ class TrafficMonitor:
             if not ret:
                 logging.error("Failed to read from video source.")
                 sys.exit(1)
+
+            # Resize frame to 1024x1024 for display
+            desired_size: Tuple[int, int] = (1024, 1024)
+            frame = cv2.resize(frame, desired_size)
             self.frame_height, self.frame_width = frame.shape[:2]
             self._initialize_video_writer_instance(frame)
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to first frame
@@ -339,6 +351,8 @@ class TrafficMonitor:
                     break
 
                 self.frame_number += 1
+                # Resize frame to 1024x1024
+                frame = cv2.resize(frame, desired_size)
                 self.frame: np.ndarray = frame.copy()  # Make a copy to draw annotations
                 timestamp: datetime = datetime.now()
                 self.timestamps.append(timestamp)
@@ -346,11 +360,12 @@ class TrafficMonitor:
                 # Perform object detection with increased confidence threshold for better accuracy
                 results = self.model.predict(self.frame, conf=0.5, verbose=False)
 
-                # Extract detected classes and count vehicles
+                # Extract detected classes, count vehicles, and calculate accuracy
                 detections = results[0].boxes
-                total_vehicles, vehicle_type_count = self._process_detections(detections)
+                total_vehicles, vehicle_type_count, accuracy = self._process_detections(detections)
                 self.vehicle_counts.append(total_vehicles)
                 self.vehicle_type_counts.append(vehicle_type_count)
+                self.accuracies.append(accuracy)
                 traffic_density = self.classify_traffic_density(total_vehicles)
 
                 # Update traffic density counts for percentage calculation
@@ -359,8 +374,8 @@ class TrafficMonitor:
                 elif traffic_density == 'Medium Traffic':
                     self.medium_traffic_count += 1
 
-                # Add legend panel
-                self._add_legend_panel(traffic_density, total_vehicles, vehicle_type_count)
+                # Add legend panel with accuracy
+                self._add_legend_panel(traffic_density, total_vehicles, vehicle_type_count, accuracy)
 
                 # Write the annotated frame to the output video
                 if self.video_writer is not None:
@@ -436,7 +451,7 @@ class TrafficMonitor:
                 # Generate the HTML report in a separate thread to avoid blocking
                 report_thread: Thread = Thread(
                     target=self.report_generator.generate_html_report,
-                    args=(self.timestamps, self.vehicle_counts, self.vehicle_type_counts),
+                    args=(self.timestamps, self.vehicle_counts, self.vehicle_type_counts, self.accuracies),
                     daemon=True
                 )
                 report_thread.start()
